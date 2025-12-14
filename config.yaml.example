@@ -1,0 +1,62 @@
+# 端口号
+port: 8317
+# 远程管理配置 - 启用 WebUI
+remote-management:
+  allow-remote: true
+  secret-key: "your-secret-key-here"
+  disable-control-panel: false
+# 认证文件存放目录
+auth-dir: "/root/.cli-proxy-api"
+# 日志配置
+debug: false
+logging-to-file: true
+usage-statistics-enabled: true
+# 代理设置（不使用代理留空）
+proxy-url: ""
+# 请求重试次数
+request-retry: 3
+# 配额用完后的处理
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+# API 访问密钥
+api-keys:
+  - "your-api-key-here"
+# Gemini API Key（可选，如果有官方 API Key 可以填这里）
+# generative-language-api-key:
+#   - "AIzaSy..."
+
+# Juma API 配置
+juma-api-key:
+  - session-token: "your-juma-session-token"
+    workspace-id: "your-workspace-id"
+
+# 图床配置 - 用于 Juma 图片上传
+image-hosting:
+  enable: true
+  endpoint: "http://your-image-hosting-endpoint/api/v1/external/upload"
+  api-key: "your-image-hosting-api-key"
+
+# Gemini Web 设置
+gemini-web:
+  context: true
+  max-chars-per-request: 1000000
+  disable-continuation-hint: false
+  code-mode: false
+request-log: false
+tls:
+  enable: false
+  cert: ""
+  key: ""
+disable-cooling: false
+max-retry-interval: 0
+ws-auth: false
+openai-compatibility: []
+ampcode:
+  upstream-url: ""
+  upstream-api-key: ""
+  restrict-management-to-localhost: true
+  model-mappings: []
+payload:
+  default: []
+  override: []

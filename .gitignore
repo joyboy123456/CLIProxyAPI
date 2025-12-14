@@ -1,0 +1,25 @@
+# 敏感配置文件
+config.yaml
+auth/
+
+# 测试文件（包含敏感信息的测试脚本）
+juma_*.py
+test_*.py
+
+# 备份文件
+*.orig
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 日志
+*.log
