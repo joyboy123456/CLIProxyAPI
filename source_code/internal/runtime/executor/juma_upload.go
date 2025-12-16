@@ -11,11 +11,12 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/tidwall/gjson"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // JumaImageUploadResult contains the result of uploading an image to Juma
@@ -69,21 +70,27 @@ func UploadImageToJuma(sessionToken, workspaceID, imageDataURL string) (*JumaIma
 
 	log.Infof("juma upload: uploaded image successfully, URL: %s, KnowledgeItemID: %s", presignedData.ImageURL, presignedData.KnowledgeItemID)
 
+	// IMPORTANT: Do NOT fall back to image ID when knowledge item ID is missing.
+	// Using image.id as knowledgeItemId causes Prisma foreign key constraint errors
+	// because image.id is not a valid threadKnowledgeItem foreign key.
+	// Let the caller decide how to handle missing knowledgeItemId.
 	return &JumaImageUploadResult{
 		ID:              presignedData.ImageID,
-		KnowledgeItemID: presignedData.KnowledgeItemID,
+		KnowledgeItemID: presignedData.KnowledgeItemID, // May be empty - caller should check
 		ImageURL:        presignedData.ImageURL,
 		Name:            filename,
 	}, nil
 }
 
 type jumaPresignedData struct {
-	ImageID          string
-	KnowledgeItemID  string // This is the ID needed for knowledgeItems in chat request
-	ImageURL         string
-	PresignedURL     string
-	Fields           map[string]string
+	ImageID         string
+	KnowledgeItemID string // This is the ID needed for knowledgeItems in chat request
+	ImageURL        string
+	PresignedURL    string
+	Fields          map[string]string
 }
+
+var jumaUUIDRegex = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
 func getJumaPresignedURL(sessionToken, workspaceID, filename, mimeType string, imageSize int) (*jumaPresignedData, error) {
 	url := "https://app.juma.ai/api/trpc/fileStorage.createPresignedUrl?batch=1"
@@ -149,10 +156,10 @@ func getJumaPresignedURL(sessionToken, workspaceID, filename, mimeType string, i
 		if strings.Contains(line, "presignedUrl") {
 			// Log full response for debugging
 			log.Debugf("juma upload: presigned URL response line: %s", line)
-			
+
 			// Extract data from the JSONL response
 			jsonResult := gjson.Parse(line)
-			
+
 			// Navigate to the data: json[2][0][0] has the image and presignedUrl
 			imageData := jsonResult.Get("json.2.0.0")
 			if !imageData.Exists() {
@@ -162,11 +169,11 @@ func getJumaPresignedURL(sessionToken, workspaceID, filename, mimeType string, i
 			imageID := imageData.Get("image.id").String()
 			imageURL := imageData.Get("image.imageUrl").String()
 			presignedURL := imageData.Get("presignedUrl").String()
-			
-			// Extract knowledgeItem.id - this is the ID we need for the chat API
-			knowledgeItemID := imageData.Get("knowledgeItem.id").String()
+
+			// Extract knowledge item id - this is the ID we need for the chat API.
+			knowledgeItemID := extractJumaKnowledgeItemID(imageData, imageID)
 			log.Infof("juma upload: extracted IDs - imageID=%s, knowledgeItemID=%s", imageID, knowledgeItemID)
-			
+
 			if imageURL == "" || presignedURL == "" {
 				continue
 			}
@@ -196,15 +203,53 @@ func getJumaPresignedURL(sessionToken, workspaceID, filename, mimeType string, i
 	return presignedData, nil
 }
 
+func extractJumaKnowledgeItemID(imageData gjson.Result, imageID string) string {
+	// When type="Knowledge", the image.id IS the knowledge item ID that can be used
+	// directly in knowledgeItems for the chat API. This was confirmed by analyzing
+	// Juma's web client behavior - the same ID returned in image.id is used in
+	// knowledgeItems[].id when sending chat messages with images.
+	imageType := imageData.Get("image.type").String()
+	if imageType == "Knowledge" && imageID != "" {
+		log.Debugf("juma upload: type=Knowledge, using image.id as knowledgeItemId: %s", imageID)
+		return imageID
+	}
+
+	// Fallback: try to find explicit knowledgeItemId fields (for future API changes)
+	candidates := []string{
+		imageData.Get("knowledgeItem.id").String(),
+		imageData.Get("knowledgeItemId").String(),
+		imageData.Get("knowledgeItemID").String(),
+		imageData.Get("knowledge.id").String(),
+		imageData.Get("image.knowledgeItemId").String(),
+		imageData.Get("image.knowledgeItem.id").String(),
+		imageData.Get("knowledgeItem.knowledgeItemId").String(),
+	}
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+
+	// If type is not "Knowledge" but we have an imageID, still try to use it
+	// as some Juma configurations may work this way
+	if imageID != "" {
+		log.Debugf("juma upload: no explicit knowledgeItemId found, using image.id as fallback: %s", imageID)
+		return imageID
+	}
+
+	return ""
+}
+
 func uploadToJumaS3(presignedData *jumaPresignedData, imageData []byte, mimeType string) error {
 	// Create multipart form data for S3 upload
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
 	// Log all fields for debugging
-	log.Infof("juma S3 upload: presignedURL=%s", presignedData.PresignedURL)
+	log.Debugf("juma S3 upload: presignedURL=%s", presignedData.PresignedURL)
 	for k, v := range presignedData.Fields {
-		log.Infof("juma S3 upload: field %s = %s", k, v)
+		log.Debugf("juma S3 upload: field %s = %s", k, maskJumaS3FieldValue(k, v))
 	}
 
 	// S3 presigned POST requires specific field order:
@@ -217,7 +262,7 @@ func uploadToJumaS3(presignedData *jumaPresignedData, imageData []byte, mimeType
 
 	// Order matters! Write fields in the order they appear in the policy
 	fieldOrder := []string{"key", "Content-Type", "bucket", "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "Policy", "X-Amz-Signature"}
-	
+
 	for _, fieldName := range fieldOrder {
 		if value, exists := presignedData.Fields[fieldName]; exists {
 			if err := writer.WriteField(fieldName, value); err != nil {
@@ -280,6 +325,20 @@ func uploadToJumaS3(presignedData *jumaPresignedData, imageData []byte, mimeType
 	}
 
 	return nil
+}
+
+func maskJumaS3FieldValue(key, value string) string {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	switch lower {
+	case "x-amz-credential", "x-amz-signature", "policy":
+		return "<redacted>"
+	default:
+		trimmed := strings.TrimSpace(value)
+		if len(trimmed) <= 80 {
+			return trimmed
+		}
+		return trimmed[:40] + "..." + trimmed[len(trimmed)-12:]
+	}
 }
 
 func parseJumaDataURL(dataURL string) (mimeType, data string, err error) {

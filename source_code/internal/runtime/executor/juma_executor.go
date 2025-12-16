@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +25,8 @@ import (
 const (
 	// jumaBaseURL is the base URL for the Juma API.
 	jumaBaseURL = "https://app.juma.ai"
+	// jumaMaxRemoteImageBytes limits remote image fetch size when converting non-data URLs.
+	jumaMaxRemoteImageBytes = 10 << 20 // 10 MiB
 )
 
 // JumaExecutor implements a stateless executor for Juma.ai.
@@ -47,13 +50,13 @@ func (e *JumaExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) err
 
 // JumaMessage represents a message in Juma's format.
 type JumaMessage struct {
-	ID              string          `json:"id"`
-	Role            string          `json:"role"`
+	ID              string            `json:"id"`
+	Role            string            `json:"role"`
 	Parts           []JumaMessagePart `json:"parts"`
-	Content         string          `json:"content"`
-	GeneratedImages []any           `json:"generatedImages"`
-	UploadedImages  []any           `json:"uploadedImages"`
-	UploadedFiles   []any           `json:"uploadedFiles"`
+	Content         string            `json:"content"`
+	GeneratedImages []any             `json:"generatedImages"`
+	UploadedImages  []any             `json:"uploadedImages"`
+	UploadedFiles   []any             `json:"uploadedFiles"`
 }
 
 // JumaMessagePart represents a part of a Juma message.
@@ -104,10 +107,10 @@ type JumaModel struct {
 var jumaModels = []JumaModel{
 	// OpenAI models (vendor: f5275937-68f8-4bfe-b195-c48f2155263b)
 	{ID: "401637fa-151b-41f5-aa36-5416ad1314fb", Name: "GPT-5.1", Alias: "juma-gpt-5.1", Provider: "OpenAI", VendorConnectionID: "f5275937-68f8-4bfe-b195-c48f2155263b"},
-	
+
 	// Anthropic models via Bedrock (vendor: f958317e-9359-42cc-8c45-4ed306bf5f65)
 	{ID: "790cee03-6d71-4b6a-bf86-7781c9592028", Name: "Claude Opus 4.5", Alias: "juma-claude-opus-4.5", Provider: "Anthropic", VendorConnectionID: "f958317e-9359-42cc-8c45-4ed306bf5f65"},
-	
+
 	// Google AI models (vendor: 2eb35c4f-3afe-4d12-b953-70b5c8bb643e)
 	{ID: "c073a0c0-e3d0-4e0b-b36c-29584b674125", Name: "Gemini 3 Pro", Alias: "juma-gemini-3-pro", Provider: "Google", VendorConnectionID: "2eb35c4f-3afe-4d12-b953-70b5c8bb643e"},
 
@@ -137,42 +140,56 @@ func jumaCredentials(auth *cliproxyauth.Auth) (sessionToken, workspaceID, vendor
 	return
 }
 
-// JumaConversionResult contains the converted messages and collected knowledge items.
+// JumaUploadedImage represents an uploaded image in Juma's format.
+type JumaUploadedImage struct {
+	ID       string `json:"id"`
+	ImageURL string `json:"imageUrl"`
+	Name     string `json:"name"`
+}
+
+// JumaConversionResult contains the converted messages and collected image info.
 type JumaConversionResult struct {
 	Messages       []JumaMessage
-	KnowledgeItems []map[string]string
+	KnowledgeItems []map[string]string // Legacy: for knowledgeItemId if available
+	UploadedImages []JumaUploadedImage // New: for direct image attachment via uploadedImages
 }
 
 // convertToJumaMessages converts OpenAI-style messages to Juma format.
 // Supports both simple string content and array content with text/image_url parts.
-// If image hosting is configured, base64 images will be uploaded to Juma's native storage
-// and their IDs will be collected into KnowledgeItems.
-func convertToJumaMessages(cfg *config.Config, payload []byte) JumaConversionResult {
-	log.Infof("juma executor: convertToJumaMessages called, cfgNil=%v, cfgJumaKeyLen=%d", cfg == nil, func() int { if cfg != nil { return len(cfg.JumaKey) }; return 0 }())
+// When provided with Juma session credentials, it uploads base64 or remote images to
+// Juma storage and collects their knowledge item IDs into KnowledgeItems.
+func convertToJumaMessages(cfg *config.Config, payload []byte, sessionToken string, workspaceID string) JumaConversionResult {
+	log.Infof("juma executor: convertToJumaMessages called, cfgNil=%v, cfgJumaKeyLen=%d", cfg == nil, func() int {
+		if cfg != nil {
+			return len(cfg.JumaKey)
+		}
+		return 0
+	}())
 	msgs := gjson.GetBytes(payload, "messages").Array()
 	result := make([]JumaMessage, 0, len(msgs))
 	knowledgeItems := make([]map[string]string, 0)
+	uploadedImages := make([]JumaUploadedImage, 0)
 
-    // Determine if we need to inject system prompt for Nanobanana
-    model := gjson.GetBytes(payload, "model").String()
-    if isNanobananaModel(model) {
-        systemPrompt := JumaMessage{
-            ID:              uuid.New().String(),
-            Role:            "system",
-            Content:         "You are an expert image editing assistant. When the user provides an image, you MUST use the 'ImageEdit' tool to modify it according to their instructions. Do not just describe the edit. Always output the tool call.",
-            Parts:           []JumaMessagePart{{Type: "text", Text: "You are an expert image editing assistant. When the user provides an image, you MUST use the 'ImageEdit' tool to modify it according to their instructions. Do not just describe the edit. Always output the tool call."}},
-            GeneratedImages: []any{},
-            UploadedImages:  []any{},
-            UploadedFiles:   []any{},
-        }
-        result = append(result, systemPrompt)
-    }
+	// Determine if we need to inject system prompt for Nanobanana
+	model := gjson.GetBytes(payload, "model").String()
+	if isNanobananaModel(model) {
+		systemPrompt := JumaMessage{
+			ID:              uuid.New().String(),
+			Role:            "system",
+			Content:         "You are an expert image editing assistant. When the user provides an image, you MUST use the 'ImageEdit' tool to modify it according to their instructions. Do not just describe the edit. Always output the tool call.",
+			Parts:           []JumaMessagePart{{Type: "text", Text: "You are an expert image editing assistant. When the user provides an image, you MUST use the 'ImageEdit' tool to modify it according to their instructions. Do not just describe the edit. Always output the tool call."}},
+			GeneratedImages: []any{},
+			UploadedImages:  []any{},
+			UploadedFiles:   []any{},
+		}
+		result = append(result, systemPrompt)
+	}
 
 	for _, msg := range msgs {
 		role := msg.Get("role").String()
-        if role == "system" && isNanobananaModel(model) {
-            continue // Skip user-provided system prompts if we injected our own
-        }
+		if role == "system" && isNanobananaModel(model) {
+			continue // Skip user-provided system prompts if we injected our own
+		}
 
 		contentRaw := msg.Get("content")
 
@@ -181,13 +198,58 @@ func convertToJumaMessages(cfg *config.Config, payload []byte) JumaConversionRes
 		// Handle both string content and array content
 		if contentRaw.IsArray() {
 			// OpenAI vision-style content array
+			handleDataURLUpload := func(dataURL string) {
+				log.Infof("juma executor: attempting Juma upload, sessionToken=%v, workspaceID=%v", sessionToken != "", workspaceID != "")
+
+				if sessionToken == "" || workspaceID == "" {
+					log.Warnf("juma executor: missing session token or workspace ID for image upload")
+					return
+				}
+
+				uploadResult, err := UploadImageToJuma(sessionToken, workspaceID, dataURL)
+				if err != nil {
+					log.Warnf("juma executor: failed to upload image to Juma: %v", err)
+					return
+				}
+
+				log.Infof("juma executor: uploaded image to Juma, ID: %s, KnowledgeItemID: %s, URL: %s", uploadResult.ID, uploadResult.KnowledgeItemID, uploadResult.ImageURL)
+
+				// Use knowledgeItems with the knowledge item ID (this is how Juma web client works)
+				// When type="Knowledge", image.id IS the knowledge item ID that can be used directly
+				itemID := strings.TrimSpace(uploadResult.KnowledgeItemID)
+				if itemID != "" {
+					knowledgeItems = append(knowledgeItems, map[string]string{
+						"id":     itemID,
+						"source": "AttachedNewContextSnippet",
+					})
+					log.Infof("juma executor: added to knowledgeItems: ID=%s", itemID)
+				} else {
+					log.Warnf("juma executor: no knowledgeItemID returned, image won't be attached to chat")
+				}
+
+				// Also store in uploadedImages for potential future use
+				if uploadResult.ID != "" && uploadResult.ImageURL != "" {
+					uploadedImages = append(uploadedImages, JumaUploadedImage{
+						ID:       uploadResult.ID,
+						ImageURL: uploadResult.ImageURL,
+						Name:     uploadResult.Name,
+					})
+				}
+			}
+
 			for _, part := range contentRaw.Array() {
 				partType := part.Get("type").String()
 				if partType == "text" {
 					textContent += part.Get("text").String()
-				} else if partType == "image_url" {
-					// Extract URL from image_url object
+				} else if partType == "image_url" || partType == "input_image" || partType == "image" {
+					// Extract URL from various OpenAI-like vision formats.
 					url := part.Get("image_url.url").String()
+					if url == "" {
+						url = part.Get("image_url").String()
+					}
+					if url == "" {
+						url = part.Get("image.url").String()
+					}
 					if url == "" {
 						url = part.Get("url").String()
 					}
@@ -195,33 +257,16 @@ func convertToJumaMessages(cfg *config.Config, payload []byte) JumaConversionRes
 						log.Infof("juma executor: processing image URL, isDataURL=%v, cfgNil=%v", strings.HasPrefix(url, "data:"), cfg == nil)
 						// Upload base64 images to Juma's native file storage
 						if strings.HasPrefix(url, "data:") {
-							if cfg != nil && len(cfg.JumaKey) > 0 {
-								sessionToken := cfg.JumaKey[0].SessionToken
-								workspaceID := cfg.JumaKey[0].WorkspaceID
-								log.Infof("juma executor: attempting Juma upload, sessionToken=%v, workspaceID=%v", sessionToken != "", workspaceID != "")
-								
-								if sessionToken != "" && workspaceID != "" {
-									uploadResult, err := UploadImageToJuma(sessionToken, workspaceID, url)
-									if err != nil {
-										log.Warnf("juma executor: failed to upload image to Juma: %v", err)
-									} else {
-										log.Infof("juma executor: uploaded image to Juma, ID: %s, KnowledgeItemID: %s, URL: %s", uploadResult.ID, uploadResult.KnowledgeItemID, uploadResult.ImageURL)
-										// Add to knowledgeItems using the knowledgeItem ID (not image ID)
-										if uploadResult.KnowledgeItemID != "" {
-											knowledgeItems = append(knowledgeItems, map[string]string{
-												"id":     uploadResult.KnowledgeItemID,
-												"source": "AttachedNewContextSnippet",
-											})
-										} else {
-											log.Warnf("juma executor: KnowledgeItemID is empty, image may not be recognized")
-										}
-									}
-								} else {
-									log.Warnf("juma executor: missing session token or workspace ID for image upload")
-								}
+							handleDataURLUpload(url)
+						} else if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+							dataURL, err := fetchImageDataURLFromHTTP(url, jumaMaxRemoteImageBytes)
+							if err != nil {
+								log.Warnf("juma executor: failed to fetch remote image for upload: %v", err)
 							} else {
-								log.Warnf("juma executor: cfg is nil or JumaKey is empty")
+								handleDataURLUpload(dataURL)
 							}
+						} else {
+							log.Warnf("juma executor: image URL not supported (must be data:, http, or https)")
 						}
 					}
 				}
@@ -233,21 +278,83 @@ func convertToJumaMessages(cfg *config.Config, payload []byte) JumaConversionRes
 		// Build parts
 		parts := []JumaMessagePart{{Type: "text", Text: textContent}}
 
-		// Juma uses knowledgeItems for images, not uploadedImages
 		jumaMsg := JumaMessage{
 			ID:              uuid.New().String(),
 			Role:            role,
 			Content:         textContent,
 			Parts:           parts,
 			GeneratedImages: []any{},
-			UploadedImages:  []any{}, // Always empty - Juma uses knowledgeItems
+			UploadedImages:  []any{}, // Will be populated for the last user message
 			UploadedFiles:   []any{},
 		}
 		result = append(result, jumaMsg)
 	}
-	return JumaConversionResult{Messages: result, KnowledgeItems: knowledgeItems}
+
+	// Attach uploadedImages to the last user message (this is how Juma web client does it)
+	if len(uploadedImages) > 0 {
+		for i := len(result) - 1; i >= 0; i-- {
+			if result[i].Role == "user" {
+				// Convert JumaUploadedImage to []any for JSON serialization
+				imgList := make([]any, len(uploadedImages))
+				for j, img := range uploadedImages {
+					imgList[j] = map[string]any{
+						"id":       img.ID,
+						"imageUrl": img.ImageURL,
+						"name":     img.Name,
+					}
+				}
+				result[i].UploadedImages = imgList
+				log.Infof("juma executor: attached %d images to last user message", len(uploadedImages))
+				break
+			}
+		}
+	}
+
+	return JumaConversionResult{
+		Messages:       result,
+		KnowledgeItems: knowledgeItems,
+		UploadedImages: uploadedImages,
+	}
 }
 
+// fetchImageDataURLFromHTTP downloads a remote image and converts it to a data URL string.
+// A size limit is enforced to avoid excessive memory usage.
+func fetchImageDataURLFromHTTP(url string, maxBytes int64) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	limited := io.LimitReader(resp.Body, maxBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return "", fmt.Errorf("read image: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return "", fmt.Errorf("image size exceeds limit (%d bytes)", maxBytes)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = http.DetectContentType(data)
+	}
+	if !strings.HasPrefix(contentType, "image/") {
+		return "", fmt.Errorf("content-type is not image: %s", contentType)
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return fmt.Sprintf("data:%s;base64,%s", contentType, encoded), nil
+}
 
 func (e *JumaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
@@ -272,14 +379,14 @@ func (e *JumaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	// Build Juma request
-	conversionResult := convertToJumaMessages(e.cfg, req.Payload)
-	
+	conversionResult := convertToJumaMessages(e.cfg, req.Payload, sessionToken, workspaceID)
+
 	// Convert knowledge items to []any for JSON serialization
 	knowledgeItems := make([]any, len(conversionResult.KnowledgeItems))
 	for i, item := range conversionResult.KnowledgeItems {
 		knowledgeItems[i] = item
 	}
-	
+
 	jumaReq := JumaRequest{
 		Messages:           conversionResult.Messages,
 		ModelID:            model.ID,
@@ -392,7 +499,7 @@ func (e *JumaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	for scanner.Scan() {
 		line := scanner.Text()
 		appendAPIResponseChunk(ctx, e.cfg, []byte(line))
-		
+
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -416,14 +523,14 @@ func (e *JumaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 	}
 
-    // If we have an image but no text, or just to append the image
-    if generatedImageURL != "" {
-        // Append image markdown to content so it appears in Chat Completion
-        if fullContent.Len() > 0 {
-            fullContent.WriteString("\n\n")
-        }
-        fullContent.WriteString(fmt.Sprintf("![Generated Image](%s)", generatedImageURL))
-    }
+	// If we have an image but no text, or just to append the image
+	if generatedImageURL != "" {
+		// Append image markdown to content so it appears in Chat Completion
+		if fullContent.Len() > 0 {
+			fullContent.WriteString("\n\n")
+		}
+		fullContent.WriteString(fmt.Sprintf("![Generated Image](%s)", generatedImageURL))
+	}
 
 	if errScan := scanner.Err(); errScan != nil {
 		recordAPIResponseError(ctx, e.cfg, errScan)
@@ -468,14 +575,14 @@ func (e *JumaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Build Juma request
-	conversionResult := convertToJumaMessages(e.cfg, req.Payload)
-	
+	conversionResult := convertToJumaMessages(e.cfg, req.Payload, sessionToken, workspaceID)
+
 	// Convert knowledge items to []any for JSON serialization
 	knowledgeItems := make([]any, len(conversionResult.KnowledgeItems))
 	for i, item := range conversionResult.KnowledgeItems {
 		knowledgeItems[i] = item
 	}
-	
+
 	jumaReq := JumaRequest{
 		Messages:           conversionResult.Messages,
 		ModelID:            model.ID,
@@ -651,7 +758,7 @@ func (e *JumaExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 func buildOpenAIChatResponse(model, content string) []byte {
 	// Transform Juma's custom image tags to Markdown format
 	transformedContent := transformGeneratedImageTags(content)
-	
+
 	resp := map[string]any{
 		"id":      "chatcmpl-" + uuid.New().String()[:8],
 		"object":  "chat.completion",
