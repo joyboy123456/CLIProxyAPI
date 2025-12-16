@@ -20,6 +20,8 @@ test_*.py
 *.dll
 *.so
 *.dylib
+CLIProxyAPI
+source_code/server
 
 # 日志
 *.log

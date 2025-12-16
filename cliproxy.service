@@ -1,0 +1,31 @@
+[Unit]
+Description=CLI Proxy API Server
+Documentation=https://github.com/router-for-me/CLIProxyAPI
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=cliproxy
+Group=cliproxy
+WorkingDirectory=/opt/cliproxy
+ExecStart=/opt/cliproxy/CLIProxyAPI
+Environment=HOME=/opt/cliproxy
+Environment=TZ=Asia/Shanghai
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cliproxy
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cliproxy
+
+[Install]
+WantedBy=multi-user.target

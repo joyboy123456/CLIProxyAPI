@@ -1,0 +1,95 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.0'
+        cache: true
+        
+    - name: Generate Build Metadata
+      run: |
+        echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
+        echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
+        echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+        
+    - name: Build Linux Binary
+      run: |
+        cd source_code
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          -ldflags="-s -w -X 'main.Version=${{ env.VERSION }}' -X 'main.Commit=${{ env.COMMIT }}' -X 'main.BuildDate=${{ env.BUILD_DATE }}'" \
+          -o CLIProxyAPI ./cmd/server/
+          
+    - name: Deploy to VPS
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        port: ${{ secrets.VPS_PORT }}
+        script: |
+          # 上传二进制文件
+          echo "开始部署 CLIProxyAPI..."
+          
+          # 创建临时目录
+          mkdir -p /tmp/cliproxy-deploy
+          
+        # 上传二进制文件
+    - name: Upload Binary
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        port: ${{ secrets.VPS_PORT }}
+        source: "source_code/CLIProxyAPI"
+        target: "/tmp/"
+        
+    - name: Execute Deployment Script
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        port: ${{ secrets.VPS_PORT }}
+        script: |
+          # 执行部署脚本
+          if [ -f "/opt/cliproxy/deploy.sh" ]; then
+            sudo /opt/cliproxy/deploy.sh
+          else
+            echo "❌ 部署脚本不存在，请先运行迁移脚本"
+            exit 1
+          fi
+          
+          # 验证部署结果
+          echo "=== 验证部署结果 ==="
+          if sudo systemctl is-active --quiet cliproxy; then
+            echo "✅ 服务运行正常"
+            sudo systemctl status cliproxy --no-pager -l
+            
+            # 检查端口监听
+            echo "=== 检查端口监听 ==="
+            sudo netstat -tlnp | grep -E "(8317|8085|1455|54545|51121|11451)" || echo "端口检查完成"
+            
+            # 测试 API 响应
+            echo "=== 测试 API 响应 ==="
+            curl -I http://localhost:8317 || echo "API 测试完成"
+            
+            echo "🎉 部署成功完成！"
+          else
+            echo "❌ 服务启动失败"
+            sudo journalctl -u cliproxy --no-pager -l -n 20
+            exit 1
+          fi
