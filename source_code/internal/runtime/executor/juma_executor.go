@@ -60,9 +60,12 @@ type JumaMessage struct {
 }
 
 // JumaMessagePart represents a part of a Juma message.
+// Supports both text and image parts.
 type JumaMessagePart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"imageUrl,omitempty"` // For image parts (URL)
+	ImageID  string `json:"imageId,omitempty"`  // For image parts (Juma ID)
 }
 
 // JumaRequest represents the request body for Juma chat API.
@@ -167,7 +170,6 @@ func convertToJumaMessages(cfg *config.Config, payload []byte, sessionToken stri
 	}())
 	msgs := gjson.GetBytes(payload, "messages").Array()
 	result := make([]JumaMessage, 0, len(msgs))
-	knowledgeItems := make([]map[string]string, 0)
 	uploadedImages := make([]JumaUploadedImage, 0)
 
 	// Determine if we need to inject system prompt for Nanobanana
@@ -194,47 +196,42 @@ func convertToJumaMessages(cfg *config.Config, payload []byte, sessionToken stri
 		contentRaw := msg.Get("content")
 
 		var textContent string
+		// Track images for THIS specific message only
+		var msgImages []JumaUploadedImage
 
 		// Handle both string content and array content
 		if contentRaw.IsArray() {
 			// OpenAI vision-style content array
-			handleDataURLUpload := func(dataURL string) {
+			handleDataURLUpload := func(dataURL string) *JumaUploadedImage {
 				log.Infof("juma executor: attempting Juma upload, sessionToken=%v, workspaceID=%v", sessionToken != "", workspaceID != "")
 
 				if sessionToken == "" || workspaceID == "" {
 					log.Warnf("juma executor: missing session token or workspace ID for image upload")
-					return
+					return nil
 				}
 
 				uploadResult, err := UploadImageToJuma(sessionToken, workspaceID, dataURL)
 				if err != nil {
 					log.Warnf("juma executor: failed to upload image to Juma: %v", err)
-					return
+					return nil
 				}
 
 				log.Infof("juma executor: uploaded image to Juma, ID: %s, KnowledgeItemID: %s, URL: %s", uploadResult.ID, uploadResult.KnowledgeItemID, uploadResult.ImageURL)
 
-				// Use knowledgeItems with the knowledge item ID (this is how Juma web client works)
-				// When type="Knowledge", image.id IS the knowledge item ID that can be used directly
-				itemID := strings.TrimSpace(uploadResult.KnowledgeItemID)
-				if itemID != "" {
-					knowledgeItems = append(knowledgeItems, map[string]string{
-						"id":     itemID,
-						"source": "AttachedNewContextSnippet",
-					})
-					log.Infof("juma executor: added to knowledgeItems: ID=%s", itemID)
-				} else {
-					log.Warnf("juma executor: no knowledgeItemID returned, image won't be attached to chat")
-				}
-
-				// Also store in uploadedImages for potential future use
 				if uploadResult.ID != "" && uploadResult.ImageURL != "" {
-					uploadedImages = append(uploadedImages, JumaUploadedImage{
+					img := JumaUploadedImage{
 						ID:       uploadResult.ID,
 						ImageURL: uploadResult.ImageURL,
 						Name:     uploadResult.Name,
-					})
+					}
+					// Add to both message-specific and global lists
+					msgImages = append(msgImages, img)
+					uploadedImages = append(uploadedImages, img)
+					log.Infof("juma executor: added image to uploadedImages: ID=%s, URL=%s", uploadResult.ID, uploadResult.ImageURL)
+					return &img
 				}
+				log.Warnf("juma executor: no valid image ID or URL returned")
+				return nil
 			}
 
 			for _, part := range contentRaw.Array() {
@@ -275,8 +272,23 @@ func convertToJumaMessages(cfg *config.Config, payload []byte, sessionToken stri
 			textContent = contentRaw.String()
 		}
 
-		// Build parts
-		parts := []JumaMessagePart{{Type: "text", Text: textContent}}
+		// Build parts - only text parts, images are passed via uploadedImages
+		parts := []JumaMessagePart{}
+		if textContent != "" {
+			parts = append(parts, JumaMessagePart{Type: "text", Text: textContent})
+		}
+
+		// Build uploadedImages array for Juma's format
+		// Images are NOT added to parts - Juma uses uploadedImages field instead
+		msgUploadedImages := make([]any, 0)
+		for _, img := range msgImages {
+			msgUploadedImages = append(msgUploadedImages, map[string]any{
+				"id":       img.ID,
+				"imageUrl": img.ImageURL,
+				"name":     img.Name,
+			})
+			log.Infof("juma executor: added image to uploadedImages: ID=%s, URL=%s", img.ID, img.ImageURL)
+		}
 
 		jumaMsg := JumaMessage{
 			ID:              uuid.New().String(),
@@ -284,29 +296,22 @@ func convertToJumaMessages(cfg *config.Config, payload []byte, sessionToken stri
 			Content:         textContent,
 			Parts:           parts,
 			GeneratedImages: []any{},
-			UploadedImages:  []any{}, // Will be populated for the last user message
+			UploadedImages:  msgUploadedImages,
 			UploadedFiles:   []any{},
 		}
 		result = append(result, jumaMsg)
 	}
 
-	// Attach uploadedImages to the last user message (this is how Juma web client does it)
-	if len(uploadedImages) > 0 {
-		for i := len(result) - 1; i >= 0; i-- {
-			if result[i].Role == "user" {
-				// Convert JumaUploadedImage to []any for JSON serialization
-				imgList := make([]any, len(uploadedImages))
-				for j, img := range uploadedImages {
-					imgList[j] = map[string]any{
-						"id":       img.ID,
-						"imageUrl": img.ImageURL,
-						"name":     img.Name,
-					}
-				}
-				result[i].UploadedImages = imgList
-				log.Infof("juma executor: attached %d images to last user message", len(uploadedImages))
-				break
-			}
+	// Build knowledgeItems from uploaded images
+	// Juma uses knowledgeItems to reference images in chat - this is the only way that works
+	knowledgeItems := make([]map[string]string, 0, len(uploadedImages))
+	for _, img := range uploadedImages {
+		if img.ID != "" {
+			knowledgeItems = append(knowledgeItems, map[string]string{
+				"id":     img.ID,
+				"source": "AttachedNewContextSnippet",
+			})
+			log.Infof("juma executor: added to knowledgeItems: ID=%s", img.ID)
 		}
 	}
 
@@ -436,6 +441,16 @@ func (e *JumaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
+	// Debug: log the request body to see what we're sending to Juma
+	log.Infof("juma executor: sending request to Juma, knowledgeItems=%d, messages=%d", len(knowledgeItems), len(conversionResult.Messages))
+	if len(conversionResult.Messages) > 0 {
+		lastMsg := conversionResult.Messages[len(conversionResult.Messages)-1]
+		log.Infof("juma executor: last message parts=%d, uploadedImages=%d", len(lastMsg.Parts), len(lastMsg.UploadedImages))
+		for i, part := range lastMsg.Parts {
+			log.Infof("juma executor: part[%d] type=%s, imageUrl=%s, imageId=%s", i, part.Type, part.ImageURL, part.ImageID)
+		}
+	}
+
 	url := jumaBaseURL + "/api/chat/stream"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
@@ -485,7 +500,7 @@ func (e *JumaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		log.Errorf("juma executor: request error, status: %d, body: %s", httpResp.StatusCode, string(b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -632,6 +647,16 @@ func (e *JumaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
+	// Debug: log the request body to see what we're sending to Juma
+	log.Infof("juma executor stream: sending request to Juma, knowledgeItems=%d, messages=%d", len(knowledgeItems), len(conversionResult.Messages))
+	if len(conversionResult.Messages) > 0 {
+		lastMsg := conversionResult.Messages[len(conversionResult.Messages)-1]
+		log.Infof("juma executor stream: last message parts=%d, uploadedImages=%d", len(lastMsg.Parts), len(lastMsg.UploadedImages))
+		for i, part := range lastMsg.Parts {
+			log.Infof("juma executor stream: part[%d] type=%s, imageUrl=%s, imageId=%s", i, part.Type, part.ImageURL, part.ImageID)
+		}
+	}
+
 	url := jumaBaseURL + "/api/chat/stream"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
@@ -676,7 +701,7 @@ func (e *JumaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		log.Errorf("juma executor stream: request error, status: %d, body: %s", httpResp.StatusCode, string(b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("juma executor: close response body error: %v", errClose)
 		}

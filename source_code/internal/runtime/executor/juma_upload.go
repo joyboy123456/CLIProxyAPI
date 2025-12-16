@@ -68,6 +68,12 @@ func UploadImageToJuma(sessionToken, workspaceID, imageDataURL string) (*JumaIma
 		return nil, fmt.Errorf("failed to upload to S3: %w", err)
 	}
 
+	// Step 3: Wait for Juma to process the upload and create the knowledge item association
+	// This delay is necessary because Juma's backend needs time to process the S3 upload
+	// and create the threadKnowledgeItem record before we can reference it in chat.
+	log.Infof("juma upload: S3 upload complete, waiting for Juma to process...")
+	time.Sleep(2 * time.Second)
+
 	log.Infof("juma upload: uploaded image successfully, URL: %s, KnowledgeItemID: %s", presignedData.ImageURL, presignedData.KnowledgeItemID)
 
 	// IMPORTANT: Do NOT fall back to image ID when knowledge item ID is missing.
